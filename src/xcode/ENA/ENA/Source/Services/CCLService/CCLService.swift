@@ -8,6 +8,7 @@ import OpenCombine
 import AnyCodable
 import CertLogic
 import HealthCertificateToolkit
+import UIKit
 
 enum CCLDownloadError: Error {
 	case missing
@@ -44,6 +45,7 @@ struct CCLServiceMode: OptionSet {
 	let rawValue: Int
 	static let configuration = CCLServiceMode(rawValue: 1 << 0)
 	static let boosterRules = CCLServiceMode(rawValue: 1 << 1)
+	static let invalidationRules = CCLServiceMode(rawValue: 1 << 2)
 }
 
 class CCLService: CCLServable {
@@ -56,7 +58,7 @@ class CCLService: CCLServable {
 	init(
 		_ restServiceProvider: RestServiceProviding,
 		appConfiguration: AppConfigurationProviding,
-		cclServiceMode: [CCLServiceMode] = [.configuration, .boosterRules],
+		cclServiceMode: [CCLServiceMode] = [.configuration, .boosterRules, .invalidationRules],
 		signatureVerifier: SignatureVerification = SignatureVerifier(),
 		cclConfigurationResource: CCLConfigurationResource = CCLConfigurationResource()
 	) {
@@ -71,6 +73,10 @@ class CCLService: CCLServable {
 		boosterNotificationRulesResource.receiveResource = CBORReceiveResource(signatureVerifier: signatureVerifier)
 		self.boosterNotificationRulesResource = boosterNotificationRulesResource
 
+		var invalidationRulesResource = DCCRulesResource(ruleType: .invalidation)
+		invalidationRulesResource.receiveResource = CBORReceiveResource(signatureVerifier: signatureVerifier)
+		self.invalidationRulesResource = invalidationRulesResource
+
 		// boosterNotificationRules
 		self.boosterNotificationRules = []
 		if cclServiceMode.contains(.boosterRules) {
@@ -80,6 +86,18 @@ class CCLService: CCLServable {
 			case let .failure(error):
 				Log.error("Failed to load boosterNotification rules from cache - init them empty", error: error)
 				self.boosterNotificationRules = []
+			}
+		}
+		
+		// InvalidationRules
+		self.invalidationRules = []
+		if cclServiceMode.contains(.invalidationRules) {
+			switch restServiceProvider.cached(invalidationRulesResource) {
+			case let .success(rules):
+				self.invalidationRules = rules.rules
+			case let .failure(error):
+				Log.error("Failed to load invalidation rules from cache - init them empty", error: error)
+				self.invalidationRules = []
 			}
 		}
 
@@ -92,6 +110,7 @@ class CCLService: CCLServable {
 				Log.error("Failed to read ccl configurations from cache", error: error)
 			}
 		}
+		
 	}
 	
 	// MARK: - Protocol CCLServable
@@ -117,7 +136,8 @@ class CCLService: CCLServable {
 
 		var configurationDidUpdate: Bool = false
 		var boosterRulesDidUpdate: Bool = false
-
+		var invalidationRulesDidUpdate = false
+		
 		// lookup configuration updates
 		if cclServiceMode.contains(.configuration) {
 			dispatchGroup.enter()
@@ -139,7 +159,7 @@ class CCLService: CCLServable {
 		// lookup booster notification rules updates
 		if cclServiceMode.contains(.boosterRules) {
 			dispatchGroup.enter()
-			getBoosterNotificationRules { [weak self] result in
+			getDCCRules(for: boosterNotificationRulesResource) { [weak self] result in
 				defer {
 					dispatchGroup.leave()
 				}
@@ -153,9 +173,24 @@ class CCLService: CCLServable {
 				}
 			}
 		}
-
+		if cclServiceMode.contains(.invalidationRules) {
+			dispatchGroup.enter()
+			getDCCRules(for: invalidationRulesResource) { [weak self] result in
+				defer {
+					dispatchGroup.leave()
+				}
+				
+				switch result {
+				case let .success(rules):
+					self?.invalidationRules = rules
+					invalidationRulesDidUpdate = true
+				case .failure:
+					Log.error("Invalidation Rules might be loaded from the cache - skip this error")
+				}
+			}
+		}
 		dispatchGroup.notify(queue: DispatchQueue.global(qos: .default)) {
-			completion( configurationDidUpdate || boosterRulesDidUpdate )
+			completion( configurationDidUpdate || boosterRulesDidUpdate || invalidationRulesDidUpdate  )
 		}
 	}
 	
@@ -187,6 +222,7 @@ class CCLService: CCLServable {
 		let getWalletInfoInput = GetWalletInfoInput.make(
 			certificates: certificates,
 			boosterNotificationRules: boosterNotificationRules,
+			invalidationRules: invalidationRules,
 			identifier: identifer
 		)
 		
@@ -219,10 +255,12 @@ class CCLService: CCLServable {
 
 	private let cclConfigurationResource: CCLConfigurationResource
 	private let boosterNotificationRulesResource: DCCRulesResource
+	private let invalidationRulesResource: DCCRulesResource
 
 	private let cclServiceMode: [CCLServiceMode]
 
 	private var boosterNotificationRules: [Rule]
+	private var invalidationRules: [Rule]
 
 	#if DEBUG
 	private var mockDCCAdmissionCheckScenarios: DCCAdmissionCheckScenarios {
@@ -301,11 +339,12 @@ class CCLService: CCLServable {
 			}
 		}
 	}
-
-	private func getBoosterNotificationRules(
+	
+	private func getDCCRules(
+		for resourceType: DCCRulesResource,
 		completion: @escaping (Swift.Result<[Rule], CCLDownloadError>) -> Void
 	) {
-		restServiceProvider.load(boosterNotificationRulesResource) { result in
+		restServiceProvider.load(resourceType) { result in
 			switch result {
 			case let .success(receiveModel):
 				guard !receiveModel.metaData.loadedFromCache,
@@ -319,12 +358,19 @@ class CCLService: CCLServable {
 					completion(.failure(.custom(customError)))
 				} else {
 					Log.error("Unhandled error \(error.localizedDescription)", log: .vaccination)
-					completion(.failure(.custom(DCCDownloadRulesError.RULE_CLIENT_ERROR(.boosterNotification))))
+					switch resourceType.ruleType {
+					case .boosterNotification:
+						completion(.failure(.custom(DCCDownloadRulesError.RULE_CLIENT_ERROR(.boosterNotification))))
+					case .invalidation:
+						completion(.failure(.custom(DCCDownloadRulesError.RULE_CLIENT_ERROR(.boosterNotification))))
+					default:
+						break
+					}
 				}
 			}
 		}
 	}
-
+	
 	private func replaceCCLConfigurations(
 		with newCCLConfigurations: [CCLConfiguration]
 	) {
